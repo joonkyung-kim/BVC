@@ -421,7 +421,7 @@ def animate_simulation(
     """
     # Create simulation copies of robots
     sim_robots = []
-    robot_scale = 2.0  # for visualization scaling
+    robot_scale = 1.0  # for visualization scaling
     for robot in robots:
         new_robot = Robot(
             robot.position.copy(),
@@ -614,7 +614,9 @@ def run_yaml_environment(yaml_config, use_right_hand_rule=True, max_steps=1000, 
     """
     Run the simulation using the provided YAML environment configuration.
     """
-    robots, obstacles, env_size = create_environment_from_yaml(yaml_config)
+    robots, obstacles, env_size = create_environment_from_yaml(
+        yaml_config, robot_radius=0.2 * (40 / 16), max_speed=0.8 * (40 / 16)
+    )
     boundary = (0, env_size[0], 0, env_size[1])
     animate_simulation(
         robots,
