@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import matplotlib
 
 matplotlib.use("TkAgg")
@@ -11,28 +12,51 @@ import argparse
 
 
 class Robot:
-    def __init__(self, position, goal, safety_radius, max_speed=1.0, id=None):
+    def __init__(self, position, goal, safety_radius, max_speed=0.8, id=None):
         """
-        Initialize a robot with single integrator dynamics.
+        Initialize a differential-drive robot.
+        The state consists of [x, y] and orientation theta (radians).
         """
-        self.position = np.array(position, dtype=float)
+        self.position = np.array(position, dtype=float)  # [x, y]
+        self.theta = 0.0  # initial heading (radians)
         self.goal = np.array(goal, dtype=float)
         self.safety_radius = safety_radius
-        self.max_speed = max_speed
+        self.max_speed = max_speed  # maximum linear speed (0.8 m/s)
+        self.max_omega = np.pi / 2  # maximum angular speed (pi/2 rad/s)
         self.id = id
         self.trajectory = [self.position.copy()]
 
-    def move_to_point(self, target_point, dt):
+    def move_diff_drive(self, target_point, dt):
         """
-        Move the robot toward a target point with limited speed.
+        Move the robot toward a target point using a simple differential-drive controller.
+        The desired velocity is computed based on the error in the robot's local frame.
+        A proportional controller is used with gains:
+            v = error_x / dt  and  ω = lambda_val * error_y / dt.
+        The commands are then saturated to the maximum linear and angular speeds.
         """
-        direction = target_point - self.position
-        distance = np.linalg.norm(direction)
-        if distance > 0:
-            direction = direction / distance
-            speed = min(distance / dt, self.max_speed)
-            velocity = direction * speed
-            self.position = self.position + velocity * dt
+        # Compute error in global coordinates
+        error = target_point - self.position
+        # Transform error into robot's local frame
+        c = math.cos(self.theta)
+        s = math.sin(self.theta)
+        # error_x is forward error, error_y is lateral error
+        error_x = c * error[0] + s * error[1]
+        error_y = -s * error[0] + c * error[1]
+
+        # Desired commands (using a gain lambda_val for lateral error correction)
+        lambda_val = 2.0  # tuning parameter for angular correction
+        v_des = error_x / dt
+        omega_des = lambda_val * error_y / dt
+
+        # Saturate commands
+        v = np.clip(v_des, 0, self.max_speed)
+        omega = np.clip(omega_des, -self.max_omega, self.max_omega)
+
+        # Update state using differential-drive kinematics
+        self.position[0] += v * math.cos(self.theta) * dt
+        self.position[1] += v * math.sin(self.theta) * dt
+        self.theta += omega * dt
+
         self.trajectory.append(self.position.copy())
 
 
@@ -75,9 +99,6 @@ class Obstacle:
         Generate a half-space constraint for collision avoidance with the obstacle.
         The constraint is returned in the form (normal, offset) meaning that any
         safe point x must satisfy: normal dot x <= offset.
-
-        Here we use the robot's current position to decide a constraint if it is
-        near or inside the obstacle. (This function is still used in the BVC computation.)
         """
         # If the point is inside the obstacle, push it out using the nearest edge.
         if self.is_point_inside(point):
@@ -121,17 +142,13 @@ def compute_boundary_constraints(position, boundary, safety_radius):
     The boundary is assumed to be [xmin, xmax, ymin, ymax] and we require:
        x >= xmin + safety_radius, x <= xmax - safety_radius,
        y >= ymin + safety_radius, y <= ymax - safety_radius.
-    Each constraint is returned in the form (normal, offset) with the inequality: normal dot x <= offset.
+    Each constraint is returned in the form (normal, offset).
     """
     xmin, xmax, ymin, ymax = boundary
     constraints = []
-    # Left boundary: x >= xmin + safety_radius  =>  -x <= - (xmin + safety_radius)
     constraints.append((np.array([-1.0, 0.0]), -(xmin + safety_radius)))
-    # Right boundary: x <= xmax - safety_radius  =>  x <= xmax - safety_radius
     constraints.append((np.array([1.0, 0.0]), xmax - safety_radius))
-    # Bottom boundary: y >= ymin + safety_radius => -y <= - (ymin + safety_radius)
     constraints.append((np.array([0.0, -1.0]), -(ymin + safety_radius)))
-    # Top boundary: y <= ymax - safety_radius => y <= ymax - safety_radius
     constraints.append((np.array([0.0, 1.0]), ymax - safety_radius))
     return constraints
 
@@ -145,30 +162,24 @@ def compute_buffered_voronoi_cell(
 ):
     """
     Compute the BVC constraints for a robot.
-    The BVC is defined (for each neighbor j) by the half-space:
-         n^T p <= n^T p_i - 0.5*||p_j-p_i|| - r_s
-    where n = (p_j-p_i)/||p_j-p_i||.
-    Optionally, a right-hand rule may adjust the safety margin.
-    Obstacle constraints (in the same half-space form) and boundary constraints are also added.
+    The BVC is defined (for each neighbor j) by:
+         n^T p <= n^T p_i - 0.5 * ||p_j - p_i|| - r_s,
+    where n = (p_j - p_i)/||p_j - p_i||.
+    Obstacle and boundary constraints are added as well.
     """
     constraints = []
     position = robot.position
     base_rs = robot.safety_radius
 
-    # Compute constraints from other robots
     for other_robot in all_robots:
         if other_robot.id == robot.id:
             continue
-
         p_ij = other_robot.position - position
         p_ij_norm = np.linalg.norm(p_ij)
         if p_ij_norm < (robot.safety_radius + other_robot.safety_radius):
             print(f"Warning: Robots {robot.id} and {other_robot.id} are too close!")
             continue
-
-        n = p_ij / p_ij_norm  # unit vector from robot i to j
-
-        # Optionally adjust safety margin with right-hand rule bias
+        n = p_ij / p_ij_norm
         if use_right_hand_rule:
             goal_vector = robot.goal - position
             if np.linalg.norm(goal_vector) > 1e-6:
@@ -189,18 +200,15 @@ def compute_buffered_voronoi_cell(
         else:
             effective_rs = base_rs
 
-        # Constraint: n^T p <= n^T position - 0.5*||p_ij|| - effective_rs
         offset = np.dot(n, position) - 0.5 * p_ij_norm - effective_rs
         constraints.append((n, offset))
 
-    # Add obstacle constraints (if any)
     if obstacles:
         for obstacle in obstacles:
             obs_constraint = obstacle.get_constraint_for_point(position, base_rs)
             if obs_constraint:
                 constraints.append(obs_constraint)
 
-    # Add boundary constraints (if a boundary is provided)
     if boundary is not None:
         bnd_constraints = compute_boundary_constraints(position, boundary, base_rs)
         constraints.extend(bnd_constraints)
@@ -210,18 +218,17 @@ def compute_buffered_voronoi_cell(
 
 def is_point_in_bvc(point, constraints):
     """
-    Check if a point satisfies all half-space constraints of the BVC.
+    Check if a point satisfies all half-space constraints.
     """
     for normal, offset in constraints:
-        if np.dot(normal, point) > offset:  # if any constraint is violated, reject
+        if np.dot(normal, point) > offset:
             return False
     return True
 
 
 def project_point_to_hyperplane(point, hyperplane):
     """
-    Project a point onto a hyperplane defined by (normal, offset):
-         normal dot x = offset.
+    Project a point onto a hyperplane defined by (normal, offset).
     """
     normal, offset = hyperplane
     normal_unit = normal / np.linalg.norm(normal)
@@ -232,18 +239,14 @@ def project_point_to_hyperplane(point, hyperplane):
 
 def find_closest_point_in_bvc(goal, position, constraints):
     """
-    Find the closest point to the goal within the BVC using the geometric algorithm.
+    Find the closest point to the goal within the BVC using a geometric algorithm.
     """
     if not constraints:
         return goal.copy()
-
     if is_point_in_bvc(goal, constraints):
         return goal.copy()
-
     closest_point = None
     min_distance = float("inf")
-
-    # Try projecting goal onto each constraint
     for i, (normal_i, offset_i) in enumerate(constraints):
         projection = project_point_to_hyperplane(goal, (normal_i, offset_i))
         other_constraints = [c for j, c in enumerate(constraints) if j != i]
@@ -252,8 +255,6 @@ def find_closest_point_in_bvc(goal, position, constraints):
             if distance < min_distance:
                 min_distance = distance
                 closest_point = projection
-
-    # If no valid projection found, try intersections of pairs of constraints
     if closest_point is None:
         for i in range(len(constraints)):
             for j in range(i + 1, len(constraints)):
@@ -271,22 +272,18 @@ def find_closest_point_in_bvc(goal, position, constraints):
                             closest_point = vertex
                 except np.linalg.LinAlgError:
                     continue
-
     if closest_point is None:
         direction = goal - position
         if np.linalg.norm(direction) > 1e-6:
             closest_point = position + 0.1 * (direction / np.linalg.norm(direction))
         else:
             closest_point = position.copy()
-
     return closest_point
 
 
 def enforce_free_space(point, obstacles, boundary, safety_radius):
     """
-    Enforce that a candidate point is inside the environment boundary and outside any inflated obstacle.
-    The boundary is assumed to be [xmin, xmax, ymin, ymax]. For obstacles, we inflate their boundaries
-    by the safety_radius.
+    Enforce that a candidate point is inside the boundary and outside any inflated obstacle.
     """
     new_point = point.copy()
     if boundary is not None:
@@ -295,7 +292,6 @@ def enforce_free_space(point, obstacles, boundary, safety_radius):
         new_point[1] = np.clip(new_point[1], ymin + safety_radius, ymax - safety_radius)
     if obstacles:
         for obs in obstacles:
-            # Inflate the obstacle by safety_radius
             inflated_xmin = obs.xmin - safety_radius
             inflated_xmax = obs.xmax + safety_radius
             inflated_ymin = obs.ymin - safety_radius
@@ -303,7 +299,6 @@ def enforce_free_space(point, obstacles, boundary, safety_radius):
             if (inflated_xmin <= new_point[0] <= inflated_xmax) and (
                 inflated_ymin <= new_point[1] <= inflated_ymax
             ):
-                # Project new_point to the nearest boundary of the inflated obstacle
                 dx_left = abs(new_point[0] - inflated_xmin)
                 dx_right = abs(inflated_xmax - new_point[0])
                 dy_bottom = abs(new_point[1] - inflated_ymin)
@@ -330,9 +325,9 @@ def simulate_bvc_collision_avoidance(
     boundary=None,
 ):
     """
-    Run the simulation: at every time step, compute the BVC (with obstacles and boundary),
-    then use the geometric algorithm to choose a target point in the BVC that is as close as possible
-    to the goal. The candidate is then enforced to lie in free space before the robot moves.
+    Run the simulation loop. At every time step, compute the BVC (with obstacles and boundary),
+    then choose a target point in the BVC that is as close as possible to the goal.
+    For differential drive robots, use move_diff_drive.
     """
     for step in range(max_steps):
         all_reached = True
@@ -343,7 +338,6 @@ def simulate_bvc_collision_avoidance(
         if all_reached:
             print(f"All robots reached their goals in {step} steps!")
             return True
-
         for robot in robots:
             bvc_constraints = compute_buffered_voronoi_cell(
                 robot, robots, obstacles, use_right_hand_rule, boundary
@@ -351,11 +345,11 @@ def simulate_bvc_collision_avoidance(
             target_point = find_closest_point_in_bvc(
                 robot.goal, robot.position, bvc_constraints
             )
-            # Enforce boundary and obstacle constraints on the target
             target_point = enforce_free_space(
                 target_point, obstacles, boundary, robot.safety_radius
             )
-            robot.move_to_point(target_point, dt)
+            # Use differential-drive motion update
+            robot.move_diff_drive(target_point, dt)
     print(
         f"Simulation ended after {max_steps} steps. Not all robots reached their goals."
     )
@@ -372,7 +366,6 @@ def approximate_bvc_as_polygon(constraints, position, max_radius=10):
             [np.cos(angles), np.sin(angles)]
         )
         return circle_points
-
     num_angles = 36
     angles = np.linspace(0, 2 * np.pi, num_angles)
     directions = np.column_stack([np.cos(angles), np.sin(angles)])
@@ -413,20 +406,19 @@ def animate_simulation(
             robot.max_speed,
             robot.id,
         )
+        # Also copy the initial orientation (here we assume 0)
+        new_robot.theta = robot.theta
         sim_robots.append(new_robot)
-
     fig, ax = plt.subplots(figsize=figure_size)
     if boundary:
         xmin, xmax, ymin, ymax = boundary
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
-
     robot_circles = []
     goal_markers = []
     trajectory_lines = []
     bvc_polygons = []
     colors = plt.cm.tab10(np.linspace(0, 1, len(sim_robots)))
-
     for i, robot in enumerate(sim_robots):
         circle = plt.Circle(
             robot.position, robot.safety_radius, fill=True, alpha=0.5, color=colors[i]
@@ -444,7 +436,6 @@ def animate_simulation(
             np.zeros((1, 2)), closed=True, fill=False, edgecolor=colors[i], alpha=0.3
         )
         bvc_polygons.append(ax.add_patch(polygon))
-
     obstacle_patches = []
     if obstacles:
         for obstacle in obstacles:
@@ -458,15 +449,13 @@ def animate_simulation(
                 alpha=0.7,
             )
             obstacle_patches.append(ax.add_patch(rect))
-
-    ax.set_title("Buffered Voronoi Cell Collision Avoidance Animation")
+    ax.set_title("Buffered Voronoi Cell Collision Avoidance (Differential Drive)")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.grid(True)
     ax.legend(loc="upper left")
     ax.set_aspect("equal")
     info_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, verticalalignment="top")
-
     all_positions = []
     step = 0
     all_reached = False
@@ -488,7 +477,7 @@ def animate_simulation(
             target_point = enforce_free_space(
                 target_point, obstacles, boundary, robot.safety_radius
             )
-            robot.move_to_point(target_point, dt)
+            robot.move_diff_drive(target_point, dt)
         all_positions.append((positions, all_reached, step))
         step += 1
 
@@ -512,7 +501,7 @@ def animate_simulation(
         fig, update, frames=len(all_positions), interval=interval, blit=True
     )
     if save_animation:
-        anim.save("bvc_collision_avoidance.mp4", writer="ffmpeg", fps=30)
+        anim.save("bvc_collision_avoidance_diff_drive.mp4", writer="ffmpeg", fps=30)
     plt.tight_layout()
     plt.show()
 
@@ -530,14 +519,12 @@ def create_environment_from_yaml(yaml_file, robot_radius=0.2, max_speed=0.8):
             config = yaml.safe_load(file)
     else:
         config = yaml_file
-
     robots = []
     for i in range(config["agentNum"]):
         start_point = config["startPoints"][i]
         goal_point = config["goalPoints"][i]
         robot = Robot(start_point, goal_point, robot_radius, max_speed=max_speed, id=i)
         robots.append(robot)
-
     obstacles = []
     for obs_config in config["obstacles"]:
         center = obs_config["center"]
@@ -545,14 +532,12 @@ def create_environment_from_yaml(yaml_file, robot_radius=0.2, max_speed=0.8):
         height = obs_config["height"]
         obstacle = Obstacle(center, width, height)
         obstacles.append(obstacle)
-
     environment_size = (40, 40)
     return robots, obstacles, environment_size
 
 
 def run_yaml_environment(yaml_config, use_right_hand_rule=True, max_steps=1000, dt=0.05):
     robots, obstacles, env_size = create_environment_from_yaml(yaml_config)
-    # Define the boundary as (xmin, xmax, ymin, ymax)
     boundary = (0, env_size[0], 0, env_size[1])
     animate_simulation(
         robots,
@@ -566,7 +551,9 @@ def run_yaml_environment(yaml_config, use_right_hand_rule=True, max_steps=1000, 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BVC Collision Avoidance Simulation")
+    parser = argparse.ArgumentParser(
+        description="BVC Collision Avoidance Differential Drive Simulation"
+    )
     parser.add_argument(
         "--config",
         type=str,
