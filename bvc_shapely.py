@@ -11,9 +11,26 @@ import argparse
 
 # NEW IMPORTS FOR SHAPELY
 from shapely.geometry import Polygon, Point
-from shapely.ops import cascaded_union
+from shapely.ops import unary_union
 
 GLOBAL_SCALE = 2.5
+
+
+def force_inside_free_space(point, free_space):
+    """
+    If 'point' is not inside the free_space polygon, project it onto free_space.
+    """
+    p = Point(point)
+    if free_space.contains(p):
+        return point
+    # If free_space is a MultiPolygon, take the largest.
+    if free_space.geom_type == "MultiPolygon":
+        poly = max(free_space.geoms, key=lambda poly: poly.area)
+    else:
+        poly = free_space
+    proj_distance = poly.exterior.project(p)
+    closest_point = poly.exterior.interpolate(proj_distance)
+    return np.array([closest_point.x, closest_point.y])
 
 
 class Robot:
@@ -40,9 +57,10 @@ class Robot:
         self.trajectory = [self.position.copy()]
         self.theta_trajectory = [self.theta]
 
-    def move_to_point(self, target_point, dt):
+    def move_to_point(self, target_point, dt, free_space=None):
         """
         Moves the robot toward target_point using differential drive control.
+        If free_space is provided, the new position is forced to lie within free_space.
         """
         desired_angle = np.arctan2(
             target_point[1] - self.position[1], target_point[0] - self.position[0]
@@ -59,8 +77,16 @@ class Robot:
         v = self.max_speed * max(0, np.cos(angle_error))
         v = min(v, distance / dt)
 
-        self.position[0] += v * np.cos(self.theta) * dt
-        self.position[1] += v * np.sin(self.theta) * dt
+        new_position = (
+            self.position
+            + np.array([v * np.cos(self.theta), v * np.sin(self.theta)]) * dt
+        )
+
+        # Force new_position into free_space if provided.
+        if free_space is not None:
+            new_position = force_inside_free_space(new_position, free_space)
+
+        self.position = new_position
         self.theta += omega * dt
         self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
 
@@ -136,17 +162,15 @@ class Obstacle:
 
 
 def compute_buffered_voronoi_cell(
-    robot: Robot,
-    all_robots: list,
-    obstacles: list = None,
-    use_right_hand_rule=False,
+    robot: Robot, all_robots: list, obstacles: list = None, use_right_hand_rule=False
 ):
     """
     Compute the Buffered Voronoi Cell (BVC) for a robot from its neighbors.
-    In the new approach, we ignore obstacles here since they are handled globally.
+    Obstacles are handled separately.
     """
     constraints = []
-    scale_factor = 2.0
+    # Using scale_factor 1.0 so that the BVC reflects just neighbor separation.
+    scale_factor = 1.0
     safety_radius = robot.safety_radius * scale_factor
     position = robot.position
     goal_dir = None
@@ -182,7 +206,6 @@ def compute_buffered_voronoi_cell(
         normal = -p_ij_unit
         offset = np.dot(normal, offset_point)
         constraints.append((normal, offset))
-    # In the new method, obstacles are handled separately.
     return constraints
 
 
@@ -247,13 +270,9 @@ def find_closest_point_in_bvc(goal, position, constraints):
     return closest_point
 
 
-# --- New Functions for Static Obstacles via Free-Space Intersection ---
-
-
-def compute_free_space_polygon(environment_size, obstacles):
+def compute_free_space_polygon(environment_size, obstacles, inflation):
     """
-    Compute the free-space polygon for the environment.
-    The environment is assumed to be a rectangle from (0,0) to (env_width, env_height).
+    Compute the configuration-space free region by buffering obstacles by 'inflation'.
     """
     env_width, env_height = environment_size
     env_poly = Polygon([(0, 0), (0, env_height), (env_width, env_height), (env_width, 0)])
@@ -267,16 +286,17 @@ def compute_free_space_polygon(environment_size, obstacles):
                 (obs.xmax, obs.ymin),
             ]
         )
+        obs_poly = obs_poly.buffer(inflation)
         obstacle_polys.append(obs_poly)
     if obstacle_polys:
-        obstacles_union = cascaded_union(obstacle_polys)
+        obstacles_union = unary_union(obstacle_polys)
         free_space = env_poly.difference(obstacles_union)
     else:
         free_space = env_poly
     return free_space
 
 
-def approximate_bvc_as_polygon(constraints, position, max_radius=10):
+def approximate_bvc_as_polygon(constraints, position, max_radius=20):
     if not constraints:
         angles = np.linspace(0, 2 * np.pi, 20)
         circle_points = position + max_radius * np.column_stack(
@@ -299,7 +319,7 @@ def approximate_bvc_as_polygon(constraints, position, max_radius=10):
     return np.array(polygon_points)
 
 
-def compute_safe_region(robot, bvc_constraints, free_space, max_radius=10):
+def compute_safe_region(robot, bvc_constraints, free_space, max_radius=20):
     """
     Compute the safe region for a robot by intersecting its BVC polygon with the free-space.
     """
@@ -311,14 +331,21 @@ def compute_safe_region(robot, bvc_constraints, free_space, max_radius=10):
 
 def find_closest_point_in_safe_region(goal, safe_region):
     """
-    Given a goal and a safe_region (a Shapely Polygon or MultiPolygon), find the point
-    in the region that is closest to the goal.
+    Given a goal and a safe_region (a Shapely Polygon, MultiPolygon, or GeometryCollection),
+    return the point in the region closest to the goal.
     """
     goal_point = Point(goal)
     if safe_region.is_empty:
-        return np.array(goal)  # fallback: use goal directly.
+        return np.array(goal)
 
-    # If safe_region is a MultiPolygon, choose the largest polygon.
+    # If safe_region is a GeometryCollection, extract its Polygon components.
+    if safe_region.geom_type == "GeometryCollection":
+        polys = [geom for geom in safe_region.geoms if geom.geom_type == "Polygon"]
+        if polys:
+            safe_region = unary_union(polys)
+        else:
+            return np.array(goal)
+
     if safe_region.geom_type == "Polygon":
         poly = safe_region
     elif safe_region.geom_type == "MultiPolygon":
@@ -329,13 +356,9 @@ def find_closest_point_in_safe_region(goal, safe_region):
     if poly.contains(goal_point):
         return np.array(goal)
 
-    # Project goal onto the boundary of the selected polygon.
     proj_distance = poly.exterior.project(goal_point)
     closest_point = poly.exterior.interpolate(proj_distance)
     return np.array([closest_point.x, closest_point.y])
-
-
-# --- Modified Simulation and Animation Functions ---
 
 
 def simulate_bvc_collision_avoidance(
@@ -347,11 +370,12 @@ def simulate_bvc_collision_avoidance(
     obstacles=None,
     environment_size=(40, 40),
 ):
-    # Precompute free space once from static obstacles
-    free_space_poly = compute_free_space_polygon(environment_size, obstacles)
-
+    # Compute configuration-space free region (obstacles inflated by robot.safety_radius).
+    free_space_poly = compute_free_space_polygon(
+        environment_size, obstacles, inflation=robots[0].safety_radius
+    )
+    move_threshold = 1e-3
     for step in range(max_steps):
-
         all_reached = True
         for robot in robots:
             if np.linalg.norm(robot.position - robot.goal) > goal_tolerance:
@@ -361,15 +385,25 @@ def simulate_bvc_collision_avoidance(
             print(f"All robots reached their goals in {step} steps!")
             return True
         for robot in robots:
-            # Compute BVC constraints from neighboring robots only (obstacles handled via free_space)
             bvc_constraints = compute_buffered_voronoi_cell(
                 robot, robots, obstacles=None, use_right_hand_rule=use_right_hand_rule
             )
-            # Compute safe region by intersecting BVC with free-space
             safe_region = compute_safe_region(robot, bvc_constraints, free_space_poly)
-            # Find target point in the safe region
-            target_point = find_closest_point_in_safe_region(robot.goal, safe_region)
-            robot.move_to_point(target_point, dt)
+            # Force target to be inside the free-space: if safe_region is empty, project goal onto free_space.
+            if safe_region.is_empty:
+                target_point = force_inside_free_space(robot.goal, free_space_poly)
+            else:
+                target_point = find_closest_point_in_safe_region(robot.goal, safe_region)
+                target_point = force_inside_free_space(target_point, free_space_poly)
+            # Force movement: if the computed target is too close, force a step toward goal.
+            if np.linalg.norm(target_point - robot.position) < move_threshold:
+                direction = robot.goal - robot.position
+                if np.linalg.norm(direction) > 1e-6:
+                    direction = direction / np.linalg.norm(direction)
+                    target_point = robot.position + robot.max_speed * dt * direction
+                else:
+                    target_point = robot.goal
+            robot.move_to_point(target_point, dt, free_space=free_space_poly)
     print(
         f"Simulation ended after {max_steps} steps. Not all robots reached their goals."
     )
@@ -390,7 +424,6 @@ def animate_simulation(
     environment_size=(40, 40),
 ):
     viz_radius = 0.5
-    # Create copies of robots for simulation
     sim_robots = []
     for robot in robots:
         new_robot = Robot(
@@ -403,7 +436,6 @@ def animate_simulation(
         sim_robots.append(new_robot)
 
     fig, ax = plt.subplots(figsize=figure_size)
-
     if boundary:
         xmin, xmax, ymin, ymax = boundary
         ax.set_xlim(xmin, xmax)
@@ -413,9 +445,8 @@ def animate_simulation(
     goal_markers = []
     trajectory_lines = []
     bvc_polygons = []
-    heading_lines = []  # for heading indicators
+    heading_lines = []
     colors = plt.cm.tab10(np.linspace(0, 1, len(sim_robots)))
-
     for i, robot in enumerate(sim_robots):
         circle = plt.Circle(
             robot.position, viz_radius, fill=True, alpha=0.5, color=colors[i]
@@ -452,7 +483,7 @@ def animate_simulation(
             )
             ax.add_patch(rect)
 
-    ax.set_title("BVC Collision Avoidance Animation (with Free-space Intersection)")
+    ax.set_title("BVC Collision Avoidance Animation (Forced Inside Free-space)")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.grid(True)
@@ -460,33 +491,39 @@ def animate_simulation(
     info_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, verticalalignment="top")
     all_positions = []
     step = 0
-    all_reached = False
-
-    # Precompute free-space polygon for static obstacles
-    free_space_poly = compute_free_space_polygon(environment_size, obstacles)
-
-    while step < max_steps and not all_reached:
-        print(f"Step: {step}")
+    free_space_poly = compute_free_space_polygon(
+        environment_size, obstacles, inflation=sim_robots[0].safety_radius
+    )
+    while step < max_steps:
         positions = []
         all_reached = True
         for robot in sim_robots:
             if np.linalg.norm(robot.position - robot.goal) > goal_tolerance:
                 all_reached = False
                 break
-
         for robot in sim_robots:
             positions.append(robot.position.copy())
-            # Compute BVC constraints from other robots (ignore obstacles here)
             bvc_constraints = compute_buffered_voronoi_cell(
                 robot, sim_robots, obstacles=None, use_right_hand_rule=use_right_hand_rule
             )
-            # Compute safe region by intersecting the BVC polygon with free space
             safe_region = compute_safe_region(robot, bvc_constraints, free_space_poly)
-            # Find target point in the safe region
-            target_point = find_closest_point_in_safe_region(robot.goal, safe_region)
-            robot.move_to_point(target_point, dt)
+            if safe_region.is_empty:
+                target_point = force_inside_free_space(robot.goal, free_space_poly)
+            else:
+                target_point = find_closest_point_in_safe_region(robot.goal, safe_region)
+                target_point = force_inside_free_space(target_point, free_space_poly)
+            if np.linalg.norm(target_point - robot.position) < 1e-3:
+                direction = robot.goal - robot.position
+                if np.linalg.norm(direction) > 1e-6:
+                    direction = direction / np.linalg.norm(direction)
+                    target_point = robot.position + robot.max_speed * dt * direction
+                else:
+                    target_point = robot.goal
+            robot.move_to_point(target_point, dt, free_space=free_space_poly)
         all_positions.append((positions, all_reached, step))
         step += 1
+        if all_reached:
+            break
 
     def update(frame):
         positions, reached, current_step = all_positions[frame]
@@ -495,7 +532,6 @@ def animate_simulation(
             x_data = [pos[0] for pos in robot.trajectory[: frame + 1]]
             y_data = [pos[1] for pos in robot.trajectory[: frame + 1]]
             trajectory_lines[i].set_data(x_data, y_data)
-            # Update safe region polygon for visualization
             bvc_constraints = compute_buffered_voronoi_cell(
                 robot, sim_robots, obstacles=None, use_right_hand_rule=use_right_hand_rule
             )
@@ -503,12 +539,13 @@ def animate_simulation(
             if not safe_region.is_empty:
                 if safe_region.geom_type == "Polygon":
                     poly_coords = np.array(safe_region.exterior.coords)
+                elif safe_region.geom_type == "MultiPolygon":
+                    largest_poly = max(safe_region.geoms, key=lambda p: p.area)
+                    poly_coords = np.array(largest_poly.exterior.coords)
                 else:
-                    # If the safe region is a MultiPolygon, use the largest one.
-                    poly_coords = np.array(
-                        max(safe_region, key=lambda p: p.area).exterior.coords
-                    )
-                bvc_polygons[i].set_xy(poly_coords)
+                    poly_coords = np.array([])
+                if poly_coords.size > 0:
+                    bvc_polygons[i].set_xy(poly_coords)
             pos = robot.trajectory[frame]
             theta = robot.theta_trajectory[frame]
             x0, y0 = pos
@@ -545,14 +582,12 @@ def create_environment_from_yaml(
             config = yaml.safe_load(file)
     else:
         config = yaml_file
-
     robots = []
     for i in range(config["agentNum"]):
         start_point = config["startPoints"][i]
         goal_point = config["goalPoints"][i]
         robot = Robot(start_point, goal_point, robot_radius, max_speed=max_speed, id=i)
         robots.append(robot)
-
     obstacles = []
     for obs_config in config["obstacles"]:
         center = obs_config["center"]
@@ -560,7 +595,6 @@ def create_environment_from_yaml(
         height = obs_config["height"]
         obstacle = Obstacle(center, width, height)
         obstacles.append(obstacle)
-
     environment_size = (40, 40)
     return robots, obstacles, environment_size
 
@@ -592,4 +626,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     yaml_config = load_environment(args.config)
-    run_yaml_environment(yaml_config, use_right_hand_rule=True, max_steps=2000)
+    run_yaml_environment(yaml_config, use_right_hand_rule=True, max_steps=1000, dt=0.05)

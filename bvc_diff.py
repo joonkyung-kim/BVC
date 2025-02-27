@@ -8,6 +8,7 @@ import matplotlib.patches as patches
 import matplotlib.animation as animation
 import yaml
 import argparse
+from shapely.geometry import Polygon, Point  # new import from shapely
 
 GLOBAL_SCALE = 2.5
 
@@ -24,24 +25,24 @@ class Robot:
         initial_theta=0.0,
     ):
         """
-        Differential drive 로봇 초기화
+        Differential drive robot initialization.
 
         Parameters:
         -----------
         position : numpy.ndarray
-            초기 위치 [x, y]
+            Initial position [x, y]
         goal : numpy.ndarray
-            목표 위치 [x, y]
+            Goal position [x, y]
         safety_radius : float
-            안전 반경 (여기서는 0.4)
+            Safety radius (e.g., 0.4)
         max_speed : float
-            최대 선속도 (기본 0.8)
+            Maximum linear speed
         max_angular : float
-            최대 각속도 (기본 π/2)
+            Maximum angular speed
         initial_theta : float
-            초기 방향 (라디안)
+            Initial orientation (radians)
         id : int
-            로봇 식별자
+            Robot identifier
         """
         self.position = np.array(position, dtype=float)
         self.goal = np.array(goal, dtype=float)
@@ -55,9 +56,8 @@ class Robot:
 
     def move_to_point(self, target_point, dt):
         """
-        목표 지점을 향해 differential drive 방식으로 이동.
-        목표점까지의 방향과 현재 방향의 차이에 따라 각속도를 결정하고,
-        선속도는 최대 선속도와 cos(각오차)를 곱하여 적용합니다.
+        Move the robot toward the target point using differential drive kinematics.
+        The linear speed is modulated by the cosine of the heading error.
         """
         desired_angle = np.arctan2(
             target_point[1] - self.position[1], target_point[0] - self.position[0]
@@ -65,12 +65,12 @@ class Robot:
         angle_error = desired_angle - self.theta
         angle_error = (angle_error + np.pi) % (2 * np.pi) - np.pi
 
-        # 각속도 제어
+        # Angular control
         Kp_ang = 10.0
         omega = np.clip(Kp_ang * angle_error, -self.max_angular, self.max_angular)
 
         distance = np.linalg.norm(target_point - self.position)
-        # 선속도는 최대 선속도와 cos(각오차)를 곱해서 결정 (음수이면 0)
+        # Linear speed is maximum speed times cos(angle_error) (nonnegative)
         v = self.max_speed * max(0, np.cos(angle_error))
         v = min(v, distance / dt)
 
@@ -95,55 +95,54 @@ class Obstacle:
         self.xmax = self.center[0] + self.width / 2
         self.ymin = self.center[1] - self.height / 2
         self.ymax = self.center[1] + self.height / 2
+        # Create a shapely polygon for the rectangular obstacle.
+        self.polygon = Polygon(
+            [
+                (self.xmin, self.ymin),
+                (self.xmin, self.ymax),
+                (self.xmax, self.ymax),
+                (self.xmax, self.ymin),
+            ]
+        )
 
     def get_closest_point(self, point):
-        closest_x = max(self.xmin, min(point[0], self.xmax))
-        closest_y = max(self.ymin, min(point[1], self.ymax))
-        return np.array([closest_x, closest_y])
+        """
+        Return the closest point on the obstacle's boundary to the given point.
+        """
+        p = Point(point)
+        # Project p onto the obstacle boundary (exterior)
+        proj_dist = self.polygon.exterior.project(p)
+        closest = self.polygon.exterior.interpolate(proj_dist)
+        return np.array([closest.x, closest.y])
 
     def distance_to_point(self, point):
         closest_point = self.get_closest_point(point)
         return np.linalg.norm(closest_point - point)
 
     def is_point_inside(self, point):
-        return self.xmin <= point[0] <= self.xmax and self.ymin <= point[1] <= self.ymax
+        return self.polygon.contains(Point(point))
 
     def get_constraint_for_point(self, point, safety_radius=0):
-        if self.is_point_inside(point):
-            closest_point = point.copy()
-            dx_left = point[0] - self.xmin
-            dx_right = self.xmax - point[0]
-            dy_bottom = point[1] - self.ymin
-            dy_top = self.ymax - point[1]
-            min_dist = min(dx_left, dx_right, dy_bottom, dy_top)
-            if min_dist == dx_left:
-                normal = np.array([-1.0, 0.0])
-                offset = -np.dot(normal, np.array([self.xmin - safety_radius, point[1]]))
-            elif min_dist == dx_right:
+        """
+        Using shapely, compute a half-plane constraint such that any point
+        satisfying np.dot(normal, p) >= offset is outside the obstacle plus safety margin.
+        """
+        p = np.array(point, dtype=float)
+        p_shapely = Point(p)
+        # Compute distance from p to the obstacle boundary
+        distance = p_shapely.distance(self.polygon)
+        # If the point is inside or within safety_radius of the obstacle boundary, compute a constraint.
+        if self.polygon.contains(p_shapely) or distance < safety_radius:
+            closest = self.get_closest_point(p)
+            diff = p - closest
+            norm = np.linalg.norm(diff)
+            if norm < 1e-6:
+                # If the point coincides with the boundary, pick an arbitrary normal.
                 normal = np.array([1.0, 0.0])
-                offset = -np.dot(normal, np.array([self.xmax + safety_radius, point[1]]))
-            elif min_dist == dy_bottom:
-                normal = np.array([0.0, -1.0])
-                offset = -np.dot(normal, np.array([point[0], self.ymin - safety_radius]))
             else:
-                normal = np.array([0.0, 1.0])
-                offset = -np.dot(normal, np.array([point[0], self.ymax + safety_radius]))
-            return (normal, offset)
-        closest_point = self.get_closest_point(point)
-        dist = np.linalg.norm(closest_point - point)
-        if dist <= safety_radius:
-            if np.linalg.norm(closest_point - point) > 1e-10:
-                normal = (point - closest_point) / np.linalg.norm(point - closest_point)
-            else:
-                if closest_point[0] == self.xmin:
-                    normal = np.array([-1.0, 0.0])
-                elif closest_point[0] == self.xmax:
-                    normal = np.array([1.0, 0.0])
-                elif closest_point[1] == self.ymin:
-                    normal = np.array([0.0, -1.0])
-                else:
-                    normal = np.array([0.0, 1.0])
-            constraint_point = closest_point + safety_radius * normal
+                normal = diff / norm
+            # The constraint boundary is shifted by safety_radius
+            constraint_point = closest + safety_radius * normal
             offset = np.dot(normal, constraint_point)
             return (normal, offset)
         return None
@@ -157,6 +156,7 @@ def compute_buffered_voronoi_cell(
 ):
     """
     Compute the Buffered Voronoi Cell (BVC) for a robot.
+    Incorporates constraints from neighboring robots and obstacles.
     """
     constraints = []
     scale_factor = 2.0
@@ -167,6 +167,7 @@ def compute_buffered_voronoi_cell(
         goal_vector = robot.goal - position
         if np.linalg.norm(goal_vector) > 1e-6:
             goal_dir = goal_vector / np.linalg.norm(goal_vector)
+    # Add constraints from neighboring robots
     for other_robot in all_robots:
         if other_robot.id == robot.id:
             continue
@@ -195,13 +196,12 @@ def compute_buffered_voronoi_cell(
         normal = -p_ij_unit
         offset = np.dot(normal, offset_point)
         constraints.append((normal, offset))
+    # Add obstacle constraints using the updated Shapely-based method.
     if obstacles:
         for obstacle in obstacles:
-            obstacle_constraint = obstacle.get_constraint_for_point(
-                position, safety_radius
-            )
-            if obstacle_constraint:
-                constraints.append(obstacle_constraint)
+            obs_constraint = obstacle.get_constraint_for_point(position, safety_radius)
+            if obs_constraint:
+                constraints.append(obs_constraint)
     return constraints
 
 
@@ -384,8 +384,7 @@ def animate_simulation(
 ):
     """
     Animate the BVC collision avoidance algorithm.
-    로봇의 현재 위치와 heading을 나타내는 막대기도 함께 애니메이션합니다.
-    시각화에서는 로봇 반지름을 0.4로 고정합니다.
+    Visualizes robot positions, trajectories, and heading indicators.
     """
     viz_radius = 0.5
     sim_robots: list[Robot] = []
@@ -409,7 +408,7 @@ def animate_simulation(
     goal_markers = []
     trajectory_lines = []
     bvc_polygons = []
-    heading_lines = []  # heading indicator 선들을 위한 리스트
+    heading_lines = []  # for heading indicators
     colors = plt.cm.tab10(np.linspace(0, 1, len(sim_robots)))
 
     for i, robot in enumerate(sim_robots):
@@ -429,7 +428,7 @@ def animate_simulation(
             np.zeros((1, 2)), closed=True, fill=False, edgecolor=colors[i], alpha=0.3
         )
         bvc_polygons.append(ax.add_patch(polygon))
-        # heading indicator 초기화: viz_radius 길이의 선분
+        # Initialize heading indicator line (length = viz_radius)
         x0, y0 = robot.position
         x1 = x0 + viz_radius * np.cos(robot.theta)
         y1 = y0 + viz_radius * np.sin(robot.theta)
@@ -453,7 +452,6 @@ def animate_simulation(
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.grid(True)
-    # ax.legend(loc="upper left")
     ax.set_aspect("equal")
     info_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, verticalalignment="top")
     all_positions = []
@@ -475,11 +473,9 @@ def animate_simulation(
             bvc_constraints = compute_buffered_voronoi_cell(
                 robot, sim_robots, obstacles, use_right_hand_rule
             )
-
             target_point = find_closest_point_in_bvc(
                 robot.goal, robot.position, bvc_constraints
             )
-
             robot.move_to_point(target_point, dt)
         all_positions.append((positions, all_reached, step))
         step += 1
@@ -496,12 +492,12 @@ def animate_simulation(
             )
             polygon_points = approximate_bvc_as_polygon(bvc_constraints, robot.position)
             bvc_polygons[i].set_xy(polygon_points)
-            # heading indicator 업데이트: 현재 위치와 해당 frame의 theta 사용 (길이 = viz_radius)
-            pos = robot.trajectory[frame]
-            theta = robot.theta_trajectory[frame]
-            x0, y0 = pos
-            x1 = x0 + viz_radius * np.cos(theta)
-            y1 = y0 + viz_radius * np.sin(theta)
+            # Update heading indicator using current position and theta at this frame
+            pos_frame = robot.trajectory[frame]
+            theta_frame = robot.theta_trajectory[frame]
+            x0, y0 = pos_frame
+            x1 = x0 + viz_radius * np.cos(theta_frame)
+            y1 = y0 + viz_radius * np.sin(theta_frame)
             heading_lines[i].set_data([x0, x1], [y0, y1])
         status = "COMPLETE" if reached else "IN PROGRESS"
         info_text.set_text(f"Step: {current_step} | Status: {status}")
@@ -526,7 +522,7 @@ def load_environment(yaml_file):
 
 def create_environment_from_yaml(
     yaml_file, robot_radius=0.5, max_speed=0.8 * GLOBAL_SCALE
-):  # -> tuple[list, list, tuple[Literal[40], Literal[40]]]:
+):
     config = None
     if isinstance(yaml_file, str):
         with open(yaml_file, "r") as file:
@@ -568,7 +564,9 @@ def run_yaml_environment(yaml_config, use_right_hand_rule=True, max_steps=1000, 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ORCA Simulation with configurable path")
+    parser = argparse.ArgumentParser(
+        description="BVC Collision Avoidance Simulation with Obstacles"
+    )
     parser.add_argument(
         "--config",
         type=str,
