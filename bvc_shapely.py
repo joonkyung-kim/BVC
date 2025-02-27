@@ -311,7 +311,7 @@ def compute_safe_region(robot, bvc_constraints, free_space, max_radius=10):
 
 def find_closest_point_in_safe_region(goal, safe_region):
     """
-    Given a goal and a safe_region (a Shapely polygon or MultiPolygon), find the point
+    Given a goal and a safe_region (a Shapely Polygon or MultiPolygon), find the point
     in the region that is closest to the goal.
     """
     goal_point = Point(goal)
@@ -322,7 +322,7 @@ def find_closest_point_in_safe_region(goal, safe_region):
     if safe_region.geom_type == "Polygon":
         poly = safe_region
     elif safe_region.geom_type == "MultiPolygon":
-        poly = max(safe_region, key=lambda p: p.area)
+        poly = max(safe_region.geoms, key=lambda p: p.area)
     else:
         poly = safe_region  # fallback
 
