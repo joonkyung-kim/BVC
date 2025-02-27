@@ -25,6 +25,7 @@ class Robot:
         self.max_omega = np.pi / 2  # maximum angular speed (pi/2 rad/s)
         self.id = id
         self.trajectory = [self.position.copy()]
+        self.orientations = [self.theta]  # record heading history
 
     def move_diff_drive(self, target_point, dt):
         """
@@ -58,6 +59,7 @@ class Robot:
         self.theta += omega * dt
 
         self.trajectory.append(self.position.copy())
+        self.orientations.append(self.theta)
 
 
 class Obstacle:
@@ -100,7 +102,6 @@ class Obstacle:
         The constraint is returned in the form (normal, offset) meaning that any
         safe point x must satisfy: normal dot x <= offset.
         """
-        # If the point is inside the obstacle, push it out using the nearest edge.
         if self.is_point_inside(point):
             dx_left = point[0] - self.xmin
             dx_right = self.xmax - point[0]
@@ -108,20 +109,19 @@ class Obstacle:
             dy_top = self.ymax - point[1]
             min_dist = min(dx_left, dx_right, dy_bottom, dy_top)
             if min_dist == dx_left:
-                normal = np.array([1.0, 0.0])  # push right
+                normal = np.array([1.0, 0.0])
                 offset = np.dot(normal, np.array([self.xmin + safety_radius, point[1]]))
             elif min_dist == dx_right:
-                normal = np.array([-1.0, 0.0])  # push left
+                normal = np.array([-1.0, 0.0])
                 offset = np.dot(normal, np.array([self.xmax - safety_radius, point[1]]))
             elif min_dist == dy_bottom:
-                normal = np.array([0.0, 1.0])  # push up
+                normal = np.array([0.0, 1.0])
                 offset = np.dot(normal, np.array([point[0], self.ymin + safety_radius]))
-            else:  # dy_top
-                normal = np.array([0.0, -1.0])  # push down
+            else:
+                normal = np.array([0.0, -1.0])
                 offset = np.dot(normal, np.array([point[0], self.ymax - safety_radius]))
             return (normal, offset)
 
-        # If the point is close to the obstacle, create a constraint to keep a buffer.
         closest_point = self.get_closest_point(point)
         dist = np.linalg.norm(closest_point - point)
         if dist <= safety_radius:
@@ -132,17 +132,15 @@ class Obstacle:
             constraint_point = closest_point + safety_radius * normal
             offset = np.dot(normal, constraint_point)
             return (normal, offset)
-
         return None
 
 
 def compute_boundary_constraints(position, boundary, safety_radius):
     """
     Generate half-space constraints to keep a point inside the boundary.
-    The boundary is assumed to be [xmin, xmax, ymin, ymax] and we require:
+    The boundary is [xmin, xmax, ymin, ymax]. We require:
        x >= xmin + safety_radius, x <= xmax - safety_radius,
        y >= ymin + safety_radius, y <= ymax - safety_radius.
-    Each constraint is returned in the form (normal, offset).
     """
     xmin, xmax, ymin, ymax = boundary
     constraints = []
@@ -383,7 +381,7 @@ def approximate_bvc_as_polygon(constraints, position, max_radius=10):
 
 
 def animate_simulation(
-    robots,
+    robots: list[Robot],
     dt=0.05,
     max_steps=1000,
     goal_tolerance=0.1,
@@ -396,17 +394,19 @@ def animate_simulation(
 ):
     """
     Animate the simulation of BVC collision avoidance.
+    Now includes a "stick" (heading arrow) for each robot.
     """
-    sim_robots = []
+    sim_robots: list[Robot] = []
+    robot_scale = 2.0  # 1.5
     for robot in robots:
         new_robot = Robot(
             robot.position.copy(),
             robot.goal.copy(),
-            robot.safety_radius,
+            robot.safety_radius
+            * robot_scale,  # safety radius is increased for visualization
             robot.max_speed,
             robot.id,
         )
-        # Also copy the initial orientation (here we assume 0)
         new_robot.theta = robot.theta
         sim_robots.append(new_robot)
     fig, ax = plt.subplots(figsize=figure_size)
@@ -417,11 +417,16 @@ def animate_simulation(
     robot_circles = []
     goal_markers = []
     trajectory_lines = []
+    heading_lines = []  # to display robot headings
     bvc_polygons = []
-    colors = plt.cm.tab10(np.linspace(0, 1, len(sim_robots)))
+    colors = plt.get_cmap("tab10")(np.linspace(0, 1, len(sim_robots)))
     for i, robot in enumerate(sim_robots):
         circle = plt.Circle(
-            robot.position, robot.safety_radius, fill=True, alpha=0.5, color=colors[i]
+            robot.position,
+            robot.safety_radius / robot_scale,
+            fill=True,
+            alpha=0.5,
+            color=colors[i],
         )
         robot_circles.append(ax.add_patch(circle))
         goal = ax.plot(robot.goal[0], robot.goal[1], "x", markersize=10, color=colors[i])[
@@ -432,6 +437,18 @@ def animate_simulation(
             [], [], "-", linewidth=1.5, color=colors[i], label=f"Robot {robot.id}"
         )
         trajectory_lines.append(trajectory)
+        # Create heading line (stick): from robot position to a point in the heading direction.
+        arrow_length = robot.safety_radius / robot_scale * 1.5
+        heading_endpoint = robot.position + arrow_length * np.array(
+            [math.cos(robot.theta), math.sin(robot.theta)]
+        )
+        (heading_line,) = ax.plot(
+            [robot.position[0], heading_endpoint[0]],
+            [robot.position[1], heading_endpoint[1]],
+            color=colors[i],
+            linewidth=2,
+        )
+        heading_lines.append(heading_line)
         polygon = patches.Polygon(
             np.zeros((1, 2)), closed=True, fill=False, edgecolor=colors[i], alpha=0.3
         )
@@ -449,7 +466,7 @@ def animate_simulation(
                 alpha=0.7,
             )
             obstacle_patches.append(ax.add_patch(rect))
-    ax.set_title("Buffered Voronoi Cell Collision Avoidance (Differential Drive)")
+    ax.set_title("BVC Collision Avoidance (Differential Drive with Heading)")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.grid(True)
@@ -484,10 +501,22 @@ def animate_simulation(
     def update(frame):
         positions, reached, current_step = all_positions[frame]
         for i, robot in enumerate(sim_robots):
+            # Update circle and trajectory
             robot_circles[i].center = robot.trajectory[frame]
             x_data = [pos[0] for pos in robot.trajectory[: frame + 1]]
             y_data = [pos[1] for pos in robot.trajectory[: frame + 1]]
             trajectory_lines[i].set_data(x_data, y_data)
+            # Update heading stick using current position and orientation from orientations history
+            current_pos = robot.trajectory[frame]
+            current_theta = robot.orientations[frame]
+            arrow_length = robot.safety_radius / robot_scale * 1.5
+            heading_endpoint = current_pos + arrow_length * np.array(
+                [math.cos(current_theta), math.sin(current_theta)]
+            )
+            heading_lines[i].set_data(
+                [current_pos[0], heading_endpoint[0]],
+                [current_pos[1], heading_endpoint[1]],
+            )
             bvc_constraints = compute_buffered_voronoi_cell(
                 robot, sim_robots, obstacles, use_right_hand_rule, boundary
             )
@@ -495,7 +524,9 @@ def animate_simulation(
             bvc_polygons[i].set_xy(polygon_points)
         status = "COMPLETE" if reached else "IN PROGRESS"
         info_text.set_text(f"Step: {current_step} | Status: {status}")
-        return robot_circles + trajectory_lines + bvc_polygons + [info_text]
+        return (
+            robot_circles + trajectory_lines + heading_lines + bvc_polygons + [info_text]
+        )
 
     anim = animation.FuncAnimation(
         fig, update, frames=len(all_positions), interval=interval, blit=True
