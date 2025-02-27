@@ -11,11 +11,23 @@ import matplotlib.animation as animation
 import yaml
 import argparse
 
+import math
+
 
 class Robot:
-    def __init__(self, position, goal, safety_radius, max_speed=1.0, id=None):
+    def __init__(
+        self,
+        position,
+        goal,
+        safety_radius,
+        max_speed=1.0,
+        max_angular_speed=1.0,
+        lambda_val=1.0,
+        id=None,
+        initial_theta=0.0,
+    ):
         """
-        Initialize a robot with single integrator dynamics
+        Initialize a differential drive robot using a conversion from single integrator dynamics.
 
         Parameters:
         -----------
@@ -26,46 +38,94 @@ class Robot:
         safety_radius : float
             Safety radius of the robot
         max_speed : float
-            Maximum speed of the robot
+            Maximum linear speed of the robot
+        max_angular_speed : float
+            Maximum angular speed of the robot
+        lambda_val : float
+            Parameter used in the int_to_uni conversion
         id : int
             Robot identifier
+        initial_theta : float
+            Initial orientation (in radians)
         """
-        self.position = np.array(position, dtype=float)
+        # State: [x, y, theta]
+        self.state = np.array([position[0], position[1], initial_theta], dtype=float)
         self.goal = np.array(goal, dtype=float)
         self.safety_radius = safety_radius
         self.max_speed = max_speed
+        self.max_angular_speed = max_angular_speed
+        self.lambda_val = lambda_val
         self.id = id
-        self.trajectory = [self.position.copy()]
+        self.trajectory = [self.state[:2].copy()]  # store only (x, y)
+
+    @property
+    def position(self):
+        # Return the (x,y) part of the state for collision avoidance and plotting
+        return self.state[:2]
+
+    def int_to_uni(self, dxi):
+        """
+        Convert single integrator velocity (dxi) into unicycle (differential drive) control commands.
+
+        Parameters:
+        -----------
+        dxi : numpy.ndarray
+            Desired velocity in R2 (dx, dy)
+
+        Returns:
+        --------
+        dxu : numpy.ndarray
+            Differential drive commands [v, omega]
+        """
+        theta = self.state[2]
+        T = np.array([[1, 0], [0, 1 / self.lambda_val]])
+        R = np.array(
+            [[math.cos(theta), math.sin(theta)], [-math.sin(theta), math.cos(theta)]]
+        )
+        dxu = T @ (R @ dxi)
+        return dxu
 
     def move_to_point(self, target_point, dt):
         """
-        Move the robot toward a target point with limited speed
+        Move the robot toward a target point using differential drive kinematics.
 
         Parameters:
         -----------
         target_point : numpy.ndarray
-            Target point to move toward
+            The target point in the plane (R2)
         dt : float
             Time step
-
-        Returns:
-        --------
-        None
         """
-        # Direction to the target
-        direction = target_point - self.position
+        current_pos = self.position
+        direction = target_point - current_pos
         distance = np.linalg.norm(direction)
 
-        if distance > 0:
-            # Normalize direction and scale by speed
-            direction = direction / distance
-            speed = min(distance / dt, self.max_speed)
-            velocity = direction * speed
+        if distance > 1e-6:
+            # Compute the desired single integrator velocity (limited by max_speed)
+            desired_speed = min(distance / dt, self.max_speed)
+            desired_velocity = (direction / distance) * desired_speed
+        else:
+            desired_velocity = np.zeros(2)
 
-            # Update position
-            self.position = self.position + velocity * dt
+        # Convert the single integrator command to differential drive commands: [v, omega]
+        control = self.int_to_uni(desired_velocity)
+        v, omega = control[0], control[1]
 
-        # Store trajectory
+        # Apply constraints on angular speed
+        omega = np.clip(omega, -self.max_angular_speed, self.max_angular_speed)
+
+        # Update state using differential drive kinematics:
+        # x_dot = v*cos(theta), y_dot = v*sin(theta), theta_dot = omega
+        theta = self.state[2]
+        dx = v * math.cos(theta) * dt
+        dy = v * math.sin(theta) * dt
+        dtheta = omega * dt
+
+        self.state[0] += dx
+        self.state[1] += dy
+        self.state[2] += dtheta
+
+        # Record the (x,y) position for visualization
         self.trajectory.append(self.position.copy())
 
 
@@ -947,7 +1007,7 @@ def run_yaml_environment(yaml_config, use_right_hand_rule=True, max_steps=1000, 
     None
     """
     # Create environment
-    robots, obstacles, env_size = create_environment_from_yaml(yaml_config)
+    robots, obstacles, env_size = create_environment_from_yaml(yaml_file=yaml_config)
 
     # Set boundary for animation
     boundary = (0, env_size[0], 0, env_size[1])
