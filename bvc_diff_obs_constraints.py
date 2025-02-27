@@ -33,7 +33,7 @@ class Robot:
         goal : numpy.ndarray
             목표 위치 [x, y]
         safety_radius : float
-            안전 반경 (여기서는 0.4)
+            안전 반경 (예: 0.4)
         max_speed : float
             최대 선속도 (기본 0.8)
         max_angular : float
@@ -57,7 +57,7 @@ class Robot:
         """
         목표 지점을 향해 differential drive 방식으로 이동.
         목표점까지의 방향과 현재 방향의 차이에 따라 각속도를 결정하고,
-        선속도는 최대 선속도와 cos(각오차)를 곱하여 적용합니다.
+        선속도는 최대 선속도와 cos(각오차)를 곱해서 적용합니다.
         """
         desired_angle = np.arctan2(
             target_point[1] - self.position[1], target_point[0] - self.position[0]
@@ -86,7 +86,7 @@ class Robot:
 class Obstacle:
     def __init__(self, center, width, height):
         """
-        Initialize a rectangular obstacle.
+        직사각형 장애물 초기화.
         """
         self.center = np.array(center, dtype=float)
         self.width = width
@@ -109,6 +109,7 @@ class Obstacle:
         return self.xmin <= point[0] <= self.xmax and self.ymin <= point[1] <= self.ymax
 
     def get_constraint_for_point(self, point, safety_radius=0):
+        # 기존 메서드 (이제는 사용하지 않고, Voronoi constraint로 대체)
         if self.is_point_inside(point):
             closest_point = point.copy()
             dx_left = point[0] - self.xmin
@@ -149,6 +150,27 @@ class Obstacle:
         return None
 
 
+def compute_obstacle_constraint(robot: Robot, obstacle: Obstacle, safety_radius: float):
+    """
+    장애물을 로봇의 Voronoi site로 취급하여 제약 조건을 계산합니다.
+    장애물의 효과적인 안전 반경은 장애물의 half-diagonal과 로봇의 safety_radius의 합으로 계산합니다.
+    """
+    position = robot.position
+    p_io = obstacle.center - position
+    p_io_norm = np.linalg.norm(p_io)
+    if p_io_norm < 1e-6:
+        return None
+    p_io_unit = p_io / p_io_norm
+    midpoint = position + 0.5 * p_io
+    # 장애물의 half-diagonal
+    r_obs = np.sqrt((obstacle.width / 2) ** 2 + (obstacle.height / 2) ** 2)
+    safety_margin_obs = safety_radius + r_obs
+    offset_point = midpoint - safety_margin_obs * p_io_unit
+    normal = -p_io_unit
+    offset = np.dot(normal, offset_point)
+    return (normal, offset)
+
+
 def compute_buffered_voronoi_cell(
     robot: Robot,
     all_robots: list[Robot],
@@ -156,7 +178,8 @@ def compute_buffered_voronoi_cell(
     use_right_hand_rule=False,
 ):
     """
-    Compute the Buffered Voronoi Cell (BVC) for a robot.
+    각 로봇의 Buffered Voronoi Cell (BVC)을 계산합니다.
+    여기서는 다른 로봇과 함께, 장애물도 Voronoi "site"로 포함하여 제약을 생성합니다.
     """
     constraints = []
     scale_factor = 2.0
@@ -167,6 +190,7 @@ def compute_buffered_voronoi_cell(
         goal_vector = robot.goal - position
         if np.linalg.norm(goal_vector) > 1e-6:
             goal_dir = goal_vector / np.linalg.norm(goal_vector)
+    # 로봇 간 제약 (논문에서 제시한 방식)
     for other_robot in all_robots:
         if other_robot.id == robot.id:
             continue
@@ -195,13 +219,12 @@ def compute_buffered_voronoi_cell(
         normal = -p_ij_unit
         offset = np.dot(normal, offset_point)
         constraints.append((normal, offset))
+    # 장애물을 Voronoi site로 포함
     if obstacles:
         for obstacle in obstacles:
-            obstacle_constraint = obstacle.get_constraint_for_point(
-                position, safety_radius
-            )
-            if obstacle_constraint:
-                constraints.append(obstacle_constraint)
+            obs_constraint = compute_obstacle_constraint(robot, obstacle, safety_radius)
+            if obs_constraint:
+                constraints.append(obs_constraint)
     return constraints
 
 
@@ -300,7 +323,7 @@ def simulate_bvc_collision_avoidance(
 
 def visualize_simulation(robots, figure_size=(10, 10), boundary=None, obstacles=None):
     """
-    Visualize the simulation results.
+    시뮬레이션 결과 시각화.
     """
     viz_radius = 0.4
     plt.figure(figsize=figure_size)
@@ -383,9 +406,8 @@ def animate_simulation(
     obstacles=None,
 ):
     """
-    Animate the BVC collision avoidance algorithm.
-    로봇의 현재 위치와 heading을 나타내는 막대기도 함께 애니메이션합니다.
-    시각화에서는 로봇 반지름을 0.4로 고정합니다.
+    BVC 충돌 회피 알고리즘 애니메이션.
+    로봇의 현재 위치, heading, 궤적 및 BVC 영역을 함께 시각화합니다.
     """
     viz_radius = 0.5
     sim_robots: list[Robot] = []
@@ -409,7 +431,7 @@ def animate_simulation(
     goal_markers = []
     trajectory_lines = []
     bvc_polygons = []
-    heading_lines = []  # heading indicator 선들을 위한 리스트
+    heading_lines = []  # heading indicator 선 리스트
     colors = plt.cm.tab10(np.linspace(0, 1, len(sim_robots)))
 
     for i, robot in enumerate(sim_robots):
@@ -429,7 +451,7 @@ def animate_simulation(
             np.zeros((1, 2)), closed=True, fill=False, edgecolor=colors[i], alpha=0.3
         )
         bvc_polygons.append(ax.add_patch(polygon))
-        # heading indicator 초기화: viz_radius 길이의 선분
+        # heading indicator 초기화 (viz_radius 길이의 선분)
         x0, y0 = robot.position
         x1 = x0 + viz_radius * np.cos(robot.theta)
         y1 = y0 + viz_radius * np.sin(robot.theta)
@@ -453,7 +475,6 @@ def animate_simulation(
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.grid(True)
-    # ax.legend(loc="upper left")
     ax.set_aspect("equal")
     info_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, verticalalignment="top")
     all_positions = []
@@ -475,11 +496,9 @@ def animate_simulation(
             bvc_constraints = compute_buffered_voronoi_cell(
                 robot, sim_robots, obstacles, use_right_hand_rule
             )
-
             target_point = find_closest_point_in_bvc(
                 robot.goal, robot.position, bvc_constraints
             )
-
             robot.move_to_point(target_point, dt)
         all_positions.append((positions, all_reached, step))
         step += 1
@@ -496,7 +515,7 @@ def animate_simulation(
             )
             polygon_points = approximate_bvc_as_polygon(bvc_constraints, robot.position)
             bvc_polygons[i].set_xy(polygon_points)
-            # heading indicator 업데이트: 현재 위치와 해당 frame의 theta 사용 (길이 = viz_radius)
+            # heading indicator 업데이트
             pos = robot.trajectory[frame]
             theta = robot.theta_trajectory[frame]
             x0, y0 = pos
@@ -526,7 +545,7 @@ def load_environment(yaml_file):
 
 def create_environment_from_yaml(
     yaml_file, robot_radius=0.5, max_speed=0.8 * GLOBAL_SCALE
-):  # -> tuple[list, list, tuple[Literal[40], Literal[40]]]:
+):
     config = None
     if isinstance(yaml_file, str):
         with open(yaml_file, "r") as file:
