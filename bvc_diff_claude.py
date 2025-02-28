@@ -21,7 +21,7 @@ from matplotlib import patches, animation
 import yaml
 import argparse
 import time
-from shapely.geometry import Polygon, Point, LineString
+from shapely.geometry import Polygon, Point, LineString, MultiPolygon
 from shapely.ops import nearest_points
 
 # Constants
@@ -124,7 +124,7 @@ class Robot:
         angle_error = (angle_error + np.pi) % (2 * np.pi) - np.pi
 
         # Angular control
-        Kp_ang = 10.0
+        Kp_ang = 4.0  # 10.0
         omega = np.clip(Kp_ang * angle_error, -self.max_angular, self.max_angular)
 
         # Linear speed control
@@ -194,21 +194,65 @@ class Robot:
         Initiate recovery behavior when robot is stuck or in collision.
         Robots that have reached their goals should not enter recovery mode.
         """
-        # Check if robot has already reached its goal
+        # Check if robot has already reached its goal.
         distance_to_goal = np.linalg.norm(self.position - self.goal)
         if distance_to_goal < self.safety_radius:
-            # Already at goal, don't initiate recovery
             self.recovery_mode = False
             self.recovery_steps_left = 0
             return
 
+        # Attempt to compute the current BVC to see if we are stuck at a vertex.
+        try:
+            bvc_poly = compute_BVC_polygon(
+                self, all_robots, obstacles, boundary, use_right_hand_rule=False
+            )
+        except Exception:
+            bvc_poly = None
+
+        if bvc_poly and not bvc_poly.is_empty:
+            # If bvc_poly is a MultiPolygon, select the largest polygon.
+            if bvc_poly.geom_type == "MultiPolygon":
+                bvc_poly = max(bvc_poly.geoms, key=lambda p: p.area)
+            # Extract vertices from the BVC polygon.
+            vertices = np.array(bvc_poly.exterior.coords)
+            # Compute distances from the robot's current position to each vertex.
+            distances = np.linalg.norm(vertices - self.position, axis=1)
+            # If the robot is very close to any vertex, consider it "stuck" at that vertex.
+            if np.any(distances < 0.05):  # 0.05 is a tunable threshold.
+                idx = np.argmin(distances)
+                num_vertices = len(vertices)
+                # Determine the adjacent vertices.
+                prev_vertex = vertices[idx - 1]
+                next_vertex = vertices[(idx + 1) % num_vertices]
+                # Compute a recovery (detour) direction along the edge.
+                edge_dir = next_vertex - prev_vertex
+                norm_edge = np.linalg.norm(edge_dir)
+                if norm_edge > 1e-6:
+                    edge_dir /= norm_edge
+                else:
+                    edge_dir = np.array([1.0, 0.0])
+                # Use the sign determined by comparing with the goal direction.
+                goal_dir = self.goal - self.position
+                if np.linalg.norm(goal_dir) > 1e-6:
+                    goal_dir /= np.linalg.norm(goal_dir)
+                else:
+                    goal_dir = np.array([1.0, 0.0])
+                # Choose the direction that deviates from the line toward the goal.
+                if np.cross(edge_dir, goal_dir) > 0:
+                    recovery_dir = edge_dir
+                else:
+                    recovery_dir = -edge_dir
+                self.recovery_direction = np.arctan2(recovery_dir[1], recovery_dir[0])
+                self.recovery_mode = True
+                self.recovery_steps_left = 20
+                return
+
+        # Fallback to potential-field recovery if not stuck at a vertex.
         self.recovery_mode = True
         self.recovery_steps_left = 20
-
-        # Calculate recovery vector
         recovery_vector = np.zeros(2)
 
-        # Add repulsion from obstacles
+        # Add repulsion from obstacles.
         if obstacles:
             for obstacle in obstacles:
                 closest = obstacle.get_closest_point(self.position)
@@ -221,7 +265,7 @@ class Robot:
                 strength = min(1.0, 0.5 / max(0.1, dist))
                 recovery_vector += vec * strength
 
-        # Add repulsion from other robots
+        # Add repulsion from other robots.
         if all_robots:
             for other in all_robots:
                 if other.id == self.id:
@@ -235,40 +279,33 @@ class Robot:
                 strength = min(1.0, 0.5 / max(0.1, dist))
                 recovery_vector += vec * strength
 
-        # Add repulsion from boundaries
+        # Add repulsion from boundaries.
         if boundary:
             xmin, xmax, ymin, ymax = boundary
             margin = self.safety_radius * 2.0
-
             # Left boundary
             dist_left = self.position[0] - xmin
             if dist_left < margin:
                 strength = min(1.0, 1.0 / max(0.1, dist_left / margin))
                 recovery_vector += np.array([strength, 0.0])
-
             # Right boundary
             dist_right = xmax - self.position[0]
             if dist_right < margin:
                 strength = min(1.0, 1.0 / max(0.1, dist_right / margin))
                 recovery_vector += np.array([-strength, 0.0])
-
             # Bottom boundary
             dist_bottom = self.position[1] - ymin
             if dist_bottom < margin:
                 strength = min(1.0, 1.0 / max(0.1, dist_bottom / margin))
                 recovery_vector += np.array([0.0, strength])
-
             # Top boundary
             dist_top = ymax - self.position[1]
             if dist_top < margin:
                 strength = min(1.0, 1.0 / max(0.1, dist_top / margin))
                 recovery_vector += np.array([0.0, -strength])
 
-        # Fallback to random direction if no clear recovery direction
         if np.linalg.norm(recovery_vector) < 1e-6:
             recovery_vector = np.array([np.random.rand() - 0.5, np.random.rand() - 0.5])
-
-        # Normalize and set direction
         recovery_vector = recovery_vector / max(1e-6, np.linalg.norm(recovery_vector))
         self.recovery_direction = np.arctan2(recovery_vector[1], recovery_vector[0])
 
@@ -1094,7 +1131,7 @@ def animate_simulation(
                 continue
 
             # Check for stuck robots
-            if robot.stuck_counter > 10:
+            if robot.stuck_counter > 20:
                 # print(f"Robot {robot.id} appears stuck. Initiating recovery.")
                 robot.initiate_recovery(obstacles, sim_robots, boundary)
                 robot.stuck_counter = 0
@@ -1304,7 +1341,7 @@ def main():
     parser.add_argument(
         "--obstacle_type",
         type=str,
-        default="free",
+        default="rectangle",
         choices=["circle", "rectangle", "free"],
         help="Type of obstacles in the environment",
     )
@@ -1370,7 +1407,7 @@ def main():
         use_right_hand_rule=not args.no_right_hand_rule,
         max_steps=args.max_steps,
         dt=args.dt,
-        use_shapely=False,  # args.use_shapely,
+        use_shapely=args.use_shapely,
     )
 
 
